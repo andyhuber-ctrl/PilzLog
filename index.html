@@ -154,7 +154,7 @@
   /* Formulare */
   .field { margin-bottom: 14px; }
   .field > label { display: block; font-size: 13px; font-weight: 600; color: var(--ink-soft); margin-bottom: 5px; }
-  .field input[type=text], .field input[type=date], .field input[type=number], .field select, .field textarea {
+  .field input[type=text], .field input[type=date], .field input[type=time], .field input[type=number], .field select, .field textarea {
     width: 100%; border: 1px solid var(--border); background: var(--surface-2); border-radius: 8px; padding: 10px 12px;
   }
   .field textarea { min-height: 70px; resize: vertical; }
@@ -292,6 +292,7 @@
   <div class="fabs" id="mapFabs">
     <button class="fab round" id="btnLocate" aria-label="Mein Standort"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
     <button class="fab" id="btnRevier"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 7 10 4l9 3 1 9-7 4-9-3z"/></svg>Revier</button>
+    <button class="fab" id="btnFoto"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Aus Foto</button>
     <button class="fab primary" id="btnFund"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Fund</button>
   </div>
   <div class="drawbar" id="drawbar">
@@ -320,6 +321,7 @@
 <div class="toast" id="toast"></div>
 <div class="viewer" id="viewer"><img id="viewerImg" alt="Foto groß"></div>
 <input type="file" id="fileInput" accept="image/*" multiple hidden>
+<input type="file" id="fotoFundInput" accept="image/*" multiple hidden>
 <input type="file" id="importInput" accept="application/json,.json" hidden>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -428,6 +430,121 @@ async function processPhoto(file) {
   URL.revokeObjectURL(img.src);
   return { blob, thumb };
 }
+
+/* ---------- Fotodaten (EXIF): Ort, Datum, Uhrzeit – Leser aus MeLog übernommen (JPEG + HEIC) ---------- */
+const Exif = (() => {
+  const SIZES = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8 };
+  const a4 = (v, o) => String.fromCharCode(v.getUint8(o), v.getUint8(o + 1), v.getUint8(o + 2), v.getUint8(o + 3));
+  function value(v, o, type, count, le) {
+    if (type === 2) { let s = ''; for (let i = 0; i < count; i++) { const c = v.getUint8(o + i); if (!c) break; s += String.fromCharCode(c); } return s; }
+    if (type === 5 || type === 10) {
+      const arr = [];
+      for (let j = 0; j < count; j++) {
+        const num = type === 5 ? v.getUint32(o + j * 8, le) : v.getInt32(o + j * 8, le);
+        const den = type === 5 ? v.getUint32(o + j * 8 + 4, le) : v.getInt32(o + j * 8 + 4, le);
+        arr.push(den === 0 ? 0 : num / den);
+      }
+      return count === 1 ? arr[0] : arr;
+    }
+    if (type === 3) return v.getUint16(o, le);
+    if (type === 4) return v.getUint32(o, le);
+    return null;
+  }
+  function ifd(v, tiff, off, le) {
+    const n = v.getUint16(off, le), tags = {};
+    for (let i = 0; i < n; i++) {
+      const e = off + 2 + i * 12, tag = v.getUint16(e, le), type = v.getUint16(e + 2, le), cnt = v.getUint32(e + 4, le);
+      const sz = SIZES[type]; if (!sz) continue;
+      tags[tag] = value(v, sz * cnt <= 4 ? e + 8 : tiff + v.getUint32(e + 8, le), type, cnt, le);
+    }
+    return tags;
+  }
+  function jpegTiff(v) {
+    if (v.byteLength < 4 || v.getUint16(0) !== 0xFFD8) return null;
+    let o = 2;
+    while (o + 4 <= v.byteLength) {
+      const m = v.getUint16(o);
+      if ((m & 0xFF00) !== 0xFF00) break;
+      if (m === 0xFFD8 || m === 0xFFD9 || (m >= 0xFFD0 && m <= 0xFFD7)) { o += 2; continue; }
+      if (m === 0xFFDA) break;
+      const len = v.getUint16(o + 2);
+      if (m === 0xFFE1 && o + 10 <= v.byteLength && v.getUint32(o + 4) === 0x45786966 && v.getUint16(o + 8) === 0) return o + 10;
+      o += 2 + len;
+    }
+    return null;
+  }
+  function boxes(v, start, end) {
+    const out = {}; let o = start;
+    while (o + 8 <= end) {
+      const size = v.getUint32(o), type = a4(v, o + 4); let head = 8, bs = size;
+      if (size === 1) { if (o + 16 > end) break; const hi = v.getUint32(o + 8), lo = v.getUint32(o + 12); bs = hi === 0 ? lo : end - o; head = 16; }
+      else if (size === 0) bs = end - o;
+      if (bs < head || o + bs > end) break;
+      if (!out[type]) out[type] = { data: o + head, end: o + bs };
+      o += bs;
+    }
+    return out;
+  }
+  const uint = (v, o, s) => s === 2 ? v.getUint16(o) : s === 4 ? v.getUint32(o) : s === 8 ? (v.getUint32(o) === 0 ? v.getUint32(o + 4) : Number.MAX_SAFE_INTEGER) : 0;
+  function heicTiff(v) {
+    if (v.byteLength < 12 || a4(v, 4) !== 'ftyp') return null;
+    const meta = boxes(v, 0, v.byteLength).meta; if (!meta) return null;
+    const mc = boxes(v, meta.data + 4, meta.end), iinf = mc.iinf, iloc = mc.iloc; if (!iinf || !iloc) return null;
+    const iv = v.getUint8(iinf.data); let p = iinf.data + 4;
+    const count = iv === 0 ? v.getUint16(p) : v.getUint32(p); p += iv === 0 ? 2 : 4;
+    let exifId = null;
+    for (let i = 0; i < count && p + 8 <= iinf.end; i++) {
+      const s = v.getUint32(p); if (s < 8) break;
+      if (a4(v, p + 4) === 'infe') {
+        const ver = v.getUint8(p + 8); let q = p + 12;
+        if (ver >= 2) { const id = ver === 2 ? v.getUint16(q) : v.getUint32(q); q += (ver === 2 ? 2 : 4) + 2; if (a4(v, q) === 'Exif') exifId = id; }
+      }
+      p += s;
+    }
+    if (exifId == null) return null;
+    const lv = v.getUint8(iloc.data); let r = iloc.data + 4;
+    const b1 = v.getUint8(r++), offS = b1 >> 4, lenS = b1 & 15, b2 = v.getUint8(r++), baseS = b2 >> 4, idxS = b2 & 15;
+    const items = lv < 2 ? v.getUint16(r) : v.getUint32(r); r += lv < 2 ? 2 : 4;
+    for (let j = 0; j < items; j++) {
+      const id = lv < 2 ? v.getUint16(r) : v.getUint32(r); r += lv < 2 ? 2 : 4;
+      if (lv === 1 || lv === 2) r += 2;
+      r += 2;
+      const base = uint(v, r, baseS); r += baseS;
+      const ext = v.getUint16(r); r += 2; let first = 0;
+      for (let k = 0; k < ext; k++) { if ((lv === 1 || lv === 2) && idxS) r += idxS; const eo = uint(v, r, offS); r += offS + lenS; if (k === 0) first = eo; }
+      if (id === exifId) { const o = base + first; if (o + 4 > v.byteLength) return null; return o + 4 + v.getUint32(o); }
+    }
+    return null;
+  }
+  function parse(v) {
+    let tiff = jpegTiff(v); if (tiff == null) tiff = heicTiff(v); if (tiff == null) return null;
+    const bo = v.getUint16(tiff), le = bo === 0x4949; if (!le && bo !== 0x4D4D) return null;
+    const ifd0 = ifd(v, tiff, tiff + v.getUint32(tiff + 4, le), le), res = {};
+    if (ifd0[0x8769] != null) {
+      const sub = ifd(v, tiff, tiff + ifd0[0x8769], le);
+      const m = /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2})/.exec(sub[0x9003] || sub[0x9004] || '');
+      if (m && +m[1] > 1990) { res.date = `${m[1]}-${m[2]}-${m[3]}`; res.time = `${m[4]}:${m[5]}`; }
+    }
+    if (ifd0[0x8825] != null) {
+      const g = ifd(v, tiff, tiff + ifd0[0x8825], le);
+      const dms = d => Array.isArray(d) && d.length >= 3 ? d[0] + d[1] / 60 + d[2] / 3600 : null;
+      const lat = dms(g[2]), lng = dms(g[4]);
+      if (lat != null && lng != null && (lat || lng)) { res.lat = g[1] === 'S' ? -lat : lat; res.lng = g[3] === 'W' ? -lng : lng; }
+    }
+    return res;
+  }
+  async function read(file) {
+    try { return parse(new DataView(await file.arrayBuffer())) || {}; } catch { return {}; }
+  }
+  return { read };
+})();
+function distM(a, b) {
+  const R = 6371000, toR = x => x * Math.PI / 180, dLa = toR(b[0] - a[0]), dLo = toR(b[1] - a[1]);
+  const h = Math.sin(dLa / 2) ** 2 + Math.cos(toR(a[0])) * Math.cos(toR(b[0])) * Math.sin(dLo / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const undListe = a => a.length > 1 ? a.slice(0, -1).join(', ') + ' und ' + a[a.length - 1] : (a[0] || '');
+const nowTime = () => { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 
 /* ---------- Wetter (Open-Meteo, ohne Schlüssel) ---------- */
 const DAILY = 'precipitation_sum,temperature_2m_mean,temperature_2m_max,temperature_2m_min,relative_humidity_2m_mean,soil_temperature_0_to_7cm_mean,soil_moisture_0_to_7cm_mean';
@@ -590,17 +707,68 @@ function redrawLine() {
   $('#dDone').disabled = drawState.pts.length < 3;
 }
 /* Zeichenmodus: Fund (Fadenkreuz) */
-function startFundPlace() {
+function startFundPlace(preset = null) {
   showView('karte');
   drawState = { mode: 'fund' };
   $('#mapFabs').style.display = 'none';
   $('#crosshair').classList.add('show');
-  $('#drawText').textContent = 'Schiebe die Karte, bis das Fadenkreuz auf der Fundstelle liegt – oder nimm deinen Standort.';
-  $('#drawRow').innerHTML = `<button class="btn" id="fGps">Mein Standort</button><button class="btn" id="fCancel">Abbrechen</button><button class="btn primary" id="fHere">Hier gefunden</button>`;
+  $('#drawText').textContent = (preset ? `${preset.queueInfo ? `Fund ${preset.queueInfo} · ` : ''}Im Foto ist kein Standort gespeichert. ` : '')
+    + 'Schiebe die Karte, bis das Fadenkreuz auf der Fundstelle liegt – oder nimm deinen Standort.';
+  $('#drawRow').innerHTML = `<button class="btn" id="fGps">Mein Standort</button><button class="btn" id="fCancel">${preset ? 'Überspringen' : 'Abbrechen'}</button><button class="btn primary" id="fHere">Hier gefunden</button>`;
   $('#drawbar').classList.add('show');
   $('#fGps').onclick = () => locate();
-  $('#fCancel').onclick = endDraw;
-  $('#fHere').onclick = () => { const c = map.getCenter(); endDraw(); openFundForm(null, [c.lat, c.lng]); };
+  $('#fCancel').onclick = () => { endDraw(); if (preset) nextFromQueue(); };
+  $('#fHere').onclick = () => { const c = map.getCenter(); endDraw(); openFundForm(null, [c.lat, c.lng], preset); };
+}
+
+/* Funde aus Fotos: Ort, Datum und Uhrzeit aus den Fotodaten. Mehrere Fotos werden nach Ort (≤ 40 m)
+   und Zeit (≤ 20 Min.) zu Funden gruppiert und nacheinander zum Bestätigen angezeigt. */
+let fundQueue = [], queueTotal = 0, queueNr = 0;
+async function startFromPhotos(files) {
+  if (!files.length) return;
+  toast(`${files.length} Foto(s) werden gelesen …`, 4000);
+  const items = [];
+  for (const file of files) {
+    try {
+      const [exif, ph] = await Promise.all([Exif.read(file), processPhoto(file)]);
+      const ts = exif.date ? parseIso(exif.date).getTime() - 12 * 3600000 + (+exif.time.slice(0, 2) * 60 + +exif.time.slice(3)) * 60000 : file.lastModified;
+      items.push({ exif, ...ph, ts, mod: file.lastModified });
+    } catch { toast('Ein Foto konnte nicht gelesen werden'); }
+  }
+  items.sort((a, b) => a.ts - b.ts);
+  const groups = [];
+  for (const it of items) {
+    const g = groups[groups.length - 1];
+    const pos = it.exif.lat != null ? [it.exif.lat, it.exif.lng] : null;
+    const near = g && Math.abs(it.ts - g.lastTs) <= 20 * 60000 && (!pos || !g.pos || distM(pos, g.pos) <= 40);
+    if (near) { g.items.push(it); g.lastTs = it.ts; if (!g.pos && pos) g.pos = pos; }
+    else groups.push({ items: [it], pos, lastTs: it.ts });
+  }
+  fundQueue = groups.map(g => {
+    const withDate = g.items.find(i => i.exif.date);
+    return {
+      lat: g.pos ? g.pos[0] : null, lng: g.pos ? g.pos[1] : null,
+      datum: withDate?.exif.date || null, uhrzeit: withDate?.exif.time || null,
+      frisch: !withDate && g.items.every(i => Date.now() - i.mod < 15 * 60000),  // gerade mit der Kamera aufgenommen
+      photos: g.items.map(i => ({ blob: i.blob, thumb: i.thumb }))
+    };
+  });
+  queueTotal = fundQueue.length; queueNr = 0;
+  if (queueTotal > 1) toast(`${items.length} Fotos → ${queueTotal} Funde erkannt`, 3500);
+  nextFromQueue();
+}
+function nextFromQueue() {
+  const p = fundQueue.shift();
+  if (!p) { if (queueTotal > 1) toast('Alle Funde aus den Fotos bearbeitet'); queueTotal = 0; return; }
+  queueNr++; p.queueInfo = queueTotal > 1 ? `${queueNr} von ${queueTotal}` : '';
+  if (p.lat != null) { map.setView([p.lat, p.lng], Math.max(map.getZoom(), 15)); openFundForm(null, [p.lat, p.lng], p); return; }
+  if (p.frisch && navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      pos => { p.lat = pos.coords.latitude; p.lng = pos.coords.longitude; p.ortQuelle = 'Standort'; p.datum = today(); p.uhrzeit = nowTime(); openFundForm(null, [p.lat, p.lng], p); },
+      () => startFundPlace(p), { enableHighAccuracy: true, timeout: 12000 });
+    return;
+  }
+  startFundPlace(p);
 }
 function endDraw() {
   if (drawState?.markers) drawState.markers.forEach(m => map.removeLayer(m));
@@ -615,8 +783,9 @@ function openSheet(html) {
   $('#sheetBody').innerHTML = html; $('#sheet').scrollTop = 0;
   $('#sheetBg').classList.add('show'); requestAnimationFrame(() => $('#sheet').classList.add('show'));
 }
-function closeSheet() { $('#sheet').classList.remove('show'); $('#sheetBg').classList.remove('show'); }
-$('#sheetBg').onclick = closeSheet;
+function closeSheet() { sheetOnDismiss = null; $('#sheet').classList.remove('show'); $('#sheetBg').classList.remove('show'); }
+function dismissSheet() { const next = sheetOnDismiss; closeSheet(); if (next) next(); }
+$('#sheetBg').onclick = dismissSheet;
 function chipGroup(name, options, selected, multi) {
   return `<div class="chips" data-chips="${name}" data-multi="${multi ? 1 : 0}">` + options.map(o =>
     `<button type="button" class="chip${(multi ? selected.includes(o) : selected === o) ? ' on' : ''}" data-val="${esc(o)}">${esc(o)}</button>`).join('') + '</div>';
@@ -702,38 +871,51 @@ function openRevier(id) {
 
 /* ---------- Funde ---------- */
 let formPhotos = [];  // { id, blob, thumb, url, neu }
-function openFundForm(id, latlng) {
-  const f = id ? state.funde.find(x => x.id === id) : { artId: '', artFrei: '', datum: today(), anzahl: 1, menge: 'einzeln', zustand: 'frisch', notiz: '', fotos: [], lat: latlng[0], lng: latlng[1] };
-  const r = f.lat != null ? revierAt([f.lat, f.lng]) : state.reviere.find(x => x.id === f.revierId);
-  formPhotos = [];
+let formPos = null;   // { lat, lng, quelle: 'Karte' | 'Foto' | 'Standort' }
+let sheetOnDismiss = null;
+function posText() {
+  if (!formPos || formPos.lat == null) return 'Ohne Ort';
+  const r = revierAt([formPos.lat, formPos.lng]);
+  return `${r ? `Revier: <b>${esc(r.name)}</b>` : 'Außerhalb deiner Reviere'} · ${formPos.lat.toFixed(4)}, ${formPos.lng.toFixed(4)}${formPos.quelle && formPos.quelle !== 'Karte' ? ` <span class="tag ok">Ort aus ${formPos.quelle}</span>` : ''}`;
+}
+function openFundForm(id, latlng, preset = null) {
+  const f = id ? state.funde.find(x => x.id === id) : {
+    artId: '', artFrei: '', datum: preset?.datum || today(), uhrzeit: preset?.uhrzeit || (preset ? '' : nowTime()),
+    anzahl: 1, menge: 'einzeln', zustand: 'frisch', notiz: '', fotos: [] };
+  formPos = id ? { lat: f.lat, lng: f.lng } : { lat: latlng[0], lng: latlng[1], quelle: preset?.lat != null ? (preset.ortQuelle || 'Foto') : 'Karte' };
+  formPhotos = (preset?.photos || []).map(p => ({ id: uid(), blob: p.blob, thumb: p.thumb, url: URL.createObjectURL(p.thumb), neu: true }));
+  sheetOnDismiss = preset ? nextFromQueue : null;
+  const fromPhoto = undListe([preset?.lat != null && !preset.ortQuelle ? 'Ort' : '', preset?.datum && !preset.ortQuelle ? 'Datum' : '', preset?.uhrzeit && !preset.ortQuelle ? 'Uhrzeit' : ''].filter(Boolean));
   const opts = PILZKARTEN.slice().sort((a, b) => a.name.localeCompare(b.name, 'de'))
     .map(p => `<option value="${p.id}"${p.id === f.artId ? ' selected' : ''}>${esc(p.name)}</option>`).join('');
   openSheet(`
-    <h2>${id ? 'Fund bearbeiten' : 'Neuer Fund'}</h2>
-    <div class="sub">${r ? `Revier: <b>${esc(r.name)}</b>` : 'Außerhalb deiner Reviere'}${f.lat != null ? ` · ${f.lat.toFixed(4)}, ${f.lng.toFixed(4)}` : ''}</div>
+    <h2>${id ? 'Fund bearbeiten' : 'Neuer Fund'}${preset?.queueInfo ? ` <span class="faint">(${preset.queueInfo})</span>` : ''}</h2>
+    <div class="sub" id="fPos">${posText()}</div>
+    <div class="hint" id="fExifHint" style="margin:-8px 0 12px">${fromPhoto ? `${fromPhoto} aus den Fotodaten übernommen.` : ''}</div>
     <div class="field"><label for="fArt">Art</label>
       <select id="fArt"><option value="">Andere / noch unbestimmt</option>${opts}</select>
       <input type="text" id="fArtFrei" value="${esc(f.artFrei)}" placeholder="Name, falls nicht in der Liste" style="margin-top:8px;${f.artId ? 'display:none' : ''}">
     </div>
     <div class="two">
       <div class="field"><label for="fDatum">Datum</label><input type="date" id="fDatum" value="${f.datum}" max="${today()}"></div>
-      <div class="field"><label for="fAnzahl">Anzahl</label><input type="number" id="fAnzahl" min="1" value="${f.anzahl}"></div>
+      <div class="field"><label for="fUhrzeit">Uhrzeit</label><input type="time" id="fUhrzeit" value="${f.uhrzeit || ''}"></div>
     </div>
+    <div class="field"><label for="fAnzahl">Anzahl</label><input type="number" id="fAnzahl" min="1" value="${f.anzahl}"></div>
     <div class="field"><label>Menge</label>${chipGroup('menge', MENGEN, f.menge, false)}</div>
     <div class="field"><label>Zustand</label>${chipGroup('zustand', ZUSTAENDE, f.zustand, false)}</div>
-    <div class="field"><label>Fotos</label><div class="photos" id="fPhotos"></div><div class="hint">Fotos werden verkleinert und ohne GPS-Daten nur auf diesem Gerät gespeichert.</div></div>
+    <div class="field"><label>Fotos</label><div class="photos" id="fPhotos"></div><div class="hint">Ort, Datum und Uhrzeit werden aus dem Foto übernommen. Die Fotos selbst werden verkleinert und ohne GPS-Daten nur auf diesem Gerät gespeichert.</div></div>
     <div class="field"><label for="fNotiz">Notiz</label><textarea id="fNotiz" placeholder="Standort genauer, Begleitbäume, Geruch …">${esc(f.notiz)}</textarea></div>
     <div class="faint">Das Wetter (21 Tage davor, 7 Tage danach) wird automatisch geholt und später ergänzt.</div>
     <div class="actions">
       <button class="btn primary" id="fSave">Speichern</button>
-      <button class="btn" id="fCancel">Abbrechen</button>
+      <button class="btn" id="fCancel">${preset?.queueInfo ? 'Überspringen' : 'Abbrechen'}</button>
       ${id ? '<button class="btn danger" id="fDel">Löschen</button>' : ''}
     </div>`);
   wireChips($('#sheetBody'));
   $('#fArt').onchange = () => { $('#fArtFrei').style.display = $('#fArt').value ? 'none' : ''; };
   (async () => { for (const pid of f.fotos) formPhotos.push({ id: pid, url: await thumbUrl(pid), neu: false }); renderFormPhotos(); })();
   renderFormPhotos();
-  $('#fCancel').onclick = closeSheet;
+  $('#fCancel').onclick = dismissSheet;
   $('#fSave').onclick = () => saveFund(id, f);
   if (id) $('#fDel').onclick = async () => {
     if (!confirm(`Fund „${pilzName(f)}“ vom ${fmtDate(f.datum)} löschen?`)) return;
@@ -750,25 +932,41 @@ function renderFormPhotos() {
 }
 $('#fileInput').onchange = async e => {
   const files = [...e.target.files]; e.target.value = '';
+  const isNew = !$('#fDel');
   for (const file of files) {
-    try { const { blob, thumb } = await processPhoto(file); formPhotos.push({ id: uid(), blob, thumb, url: URL.createObjectURL(thumb), neu: true }); }
-    catch { toast('Foto konnte nicht gelesen werden'); }
+    try {
+      const [exif, { blob, thumb }] = await Promise.all([Exif.read(file), processPhoto(file)]);
+      formPhotos.push({ id: uid(), blob, thumb, url: URL.createObjectURL(thumb), neu: true });
+      // Beim neuen Fund: Ort und Zeit aus dem ersten Foto übernehmen, das welche hat
+      if (!isNew) continue;
+      const taken = [];
+      if (exif.lat != null && formPos.quelle !== 'Foto') { formPos = { lat: exif.lat, lng: exif.lng, quelle: 'Foto' }; taken.push('Ort'); $('#fPos').innerHTML = posText(); }
+      if (exif.date && !$('#fDatum').dataset.foto) { $('#fDatum').value = exif.date; $('#fUhrzeit').value = exif.time; $('#fDatum').dataset.foto = 1; taken.push('Datum', 'Uhrzeit'); }
+      if (taken.length) $('#fExifHint').textContent = `${undListe(taken)} aus den Fotodaten übernommen.`;
+      else if (exif.lat == null && formPos.quelle !== 'Foto') $('#fExifHint').textContent = 'Im Foto ist kein Standort gespeichert. Tipp: In der iPhone-Fotoauswahl oben auf „Optionen“ tippen und „Standort“ einschalten.';
+    } catch { toast('Foto konnte nicht gelesen werden'); }
   }
   renderFormPhotos();
 };
 async function saveFund(id, old) {
   const artId = $('#fArt').value, artFrei = $('#fArtFrei').value.trim();
   const datum = $('#fDatum').value || today();
-  const f = { ...old, id: id || uid(), artId, artFrei: artId ? '' : artFrei, datum, anzahl: Math.max(1, +$('#fAnzahl').value || 1),
+  const f = { ...old, id: id || uid(), artId, artFrei: artId ? '' : artFrei, datum, uhrzeit: $('#fUhrzeit').value || '', anzahl: Math.max(1, +$('#fAnzahl').value || 1),
     menge: chipValues('menge')[0] || '', zustand: chipValues('zustand')[0] || '', notiz: $('#fNotiz').value.trim(), geaendert: today() };
   if (!id) f.angelegt = today();
-  if (f.lat != null) { const r = revierAt([f.lat, f.lng]); f.revierId = r ? r.id : null; }
+  if (formPos && formPos.lat != null) {
+    if (id && (formPos.lat !== old.lat || formPos.lng !== old.lng)) f.wetter = null;
+    f.lat = formPos.lat; f.lng = formPos.lng; if (formPos.quelle) f.ortQuelle = formPos.quelle;
+    const r = revierAt([f.lat, f.lng]); f.revierId = r ? r.id : null;
+  }
   for (const p of formPhotos.filter(p => p.neu)) await DB.put('fotos', { id: p.id, fundId: f.id, blob: p.blob, thumb: p.thumb });
   const keep = formPhotos.map(p => p.id);
   for (const pid of (old.fotos || []).filter(x => !keep.includes(x))) await DB.del('fotos', pid);
   f.fotos = keep;
   if (id && old.datum !== datum) f.wetter = null;
+  const next = sheetOnDismiss;
   await DB.put('funde', f); await loadAll(); closeSheet(); toast('Fund gespeichert');
+  if (next) next();
   if (!f.wetter?.komplett) {
     try { await updateFundWeather(f, true); await loadAll(); toast('Wetter zum Fund ergänzt'); }
     catch { toast('Wetter konnte nicht geladen werden – wird später nachgeholt'); }
@@ -781,7 +979,7 @@ async function openFund(id) {
   openSheet(`
     <div class="gallery" id="fGallery"></div>
     <h2>${esc(pilzName(f))}</h2>
-    <div class="sub">${fmtDate(f.datum)} · ${r ? esc(r.name) : 'ohne Revier'}${p ? ` · <i>${esc(p.latin)}</i>` : ''}</div>
+    <div class="sub">${fmtDate(f.datum)}${f.uhrzeit ? `, ${f.uhrzeit} Uhr` : ''} · ${r ? esc(r.name) : 'ohne Revier'}${p ? ` · <i>${esc(p.latin)}</i>` : ''}</div>
     <div>${f.anzahl ? `<span class="tag cap">${f.anzahl} Stück</span>` : ''}${f.menge ? `<span class="tag">${esc(f.menge)}</span>` : ''}${f.zustand ? `<span class="tag">${esc(f.zustand)}</span>` : ''}
       ${p ? `<span class="tag ${p.essbar === 'gut' ? 'ok' : 'warn'}">${ESSBAR_TEXT[p.essbar]}</span>` : ''}</div>
     ${f.notiz ? `<p class="muted">${esc(f.notiz)}</p>` : ''}
@@ -850,7 +1048,7 @@ $('#viewer').onclick = () => $('#viewer').classList.remove('show');
 let filterRevier = '', filterArt = '';
 async function renderFunde() {
   const el = $('#fundeInner');
-  let list = state.funde.slice().sort((a, b) => b.datum.localeCompare(a.datum));
+  let list = state.funde.slice().sort((a, b) => (b.datum + (b.uhrzeit || '')).localeCompare(a.datum + (a.uhrzeit || '')));
   if (filterRevier) list = list.filter(f => (f.revierId || '_') === filterRevier);
   if (filterArt) list = list.filter(f => (f.artId || '_') === filterArt);
   const arten = [...new Set(state.funde.map(f => f.artId || '_'))];
@@ -869,7 +1067,7 @@ async function renderFunde() {
     const r = state.reviere.find(x => x.id === f.revierId); const s = f.wetter?.sum;
     html += `<div class="card fund" data-id="${f.id}">
       <div class="thumb" data-thumb="${f.fotos[0] || ''}">${mushroomSvg()}</div>
-      <div class="txt"><b>${esc(pilzName(f))}</b><span class="faint">${fmtDate(f.datum)} · ${r ? esc(r.name) : 'ohne Revier'}</span><br>
+      <div class="txt"><b>${esc(pilzName(f))}</b><span class="faint">${fmtDate(f.datum)}${f.uhrzeit ? `, ${f.uhrzeit}` : ''} · ${r ? esc(r.name) : 'ohne Revier'}</span><br>
         ${s ? `<span class="tag">Regen 14 T.: ${r1(s.rain14)} mm</span><span class="tag">Ø ${r1(s.tmean7)} °C</span>` : '<span class="tag warn">Wetter fehlt</span>'}
         ${f.wetter && !f.wetter.komplett ? '<span class="tag">Tage danach folgen</span>' : ''}</div></div>`;
   }
@@ -1072,7 +1270,7 @@ async function openMenu() {
   const last = await DB.get('meta', 'letzteSicherung');
   const est = navigator.storage?.estimate ? await navigator.storage.estimate() : null;
   openSheet(`
-    <h2>PilzLog</h2><div class="sub">Version 0.1 · ${state.reviere.length} Reviere · ${state.funde.length} Funde${est ? ` · ${r1(est.usage / 1048576)} MB belegt` : ''}</div>
+    <h2>PilzLog</h2><div class="sub">Version 0.2 · ${state.reviere.length} Reviere · ${state.funde.length} Funde${est ? ` · ${r1(est.usage / 1048576)} MB belegt` : ''}</div>
     <div class="sectiontitle">Sicherung</div>
     <p class="muted" style="margin-top:0">Deine Daten liegen nur auf diesem Gerät. Auf dem iPhone kann Safari Daten von Webseiten löschen, die länger nicht benutzt wurden – App zum Home-Bildschirm hinzufügen und regelmäßig sichern.</p>
     <p class="faint">Letzte Sicherung: ${last ? fmtDate(last.wert) : 'noch keine'}</p>
@@ -1109,7 +1307,9 @@ async function loadAll() {
 $('#nav').onclick = e => { const b = e.target.closest('button'); if (b) showView(b.dataset.view); };
 $('#btnMenu').onclick = openMenu;
 $('#btnRevier').onclick = () => startRevierDraw();
-$('#btnFund').onclick = startFundPlace;
+$('#btnFund').onclick = () => startFundPlace();
+$('#btnFoto').onclick = () => $('#fotoFundInput').click();
+$('#fotoFundInput').onchange = e => { const files = [...e.target.files]; e.target.value = ''; startFromPhotos(files); };
 $('#btnLocate').onclick = () => locate(ll => L.circleMarker(ll, { radius: 7, color: '#fff', weight: 2, fillColor: '#2F6FA6', fillOpacity: 1 }).addTo(map));
 $('#btnLayer').onclick = () => { setBase((baseIdx + 1) % BASES.length); toast('Karte: ' + BASES[baseIdx].name, 1200); };
 

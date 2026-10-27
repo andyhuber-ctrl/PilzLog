@@ -1,6 +1,6 @@
 /* PilzLog Service Worker: App-Dateien offline verfügbar halten.
    Wetter (Open-Meteo) und Kartenkacheln werden nicht zwischengespeichert. */
-const CACHE = 'pilzlog-v1';
+const CACHE = 'pilzlog-v2';
 const SHELL = ['./', 'index.html', 'pilzkarten.js', 'manifest.webmanifest', 'icons/apple-touch-icon.png',
   'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css', 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
